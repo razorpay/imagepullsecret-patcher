@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -133,6 +134,76 @@ func TestProcessSecret(t *testing.T) {
 func TestProcessServiceAccount(t *testing.T) {
 	for _, tc := range testCasesProcessServiceAccount {
 		runTestCase(t, "ProcessServiceAccount", tc)
+	}
+}
+
+// TestMapsEqual tests the map comparison function
+func TestMapsEqual(t *testing.T) {
+	// Test cases
+	testCases := []struct {
+		name   string
+		map1   map[string]string
+		map2   map[string]string
+		equal  bool
+	}{
+		{
+			name: "identical maps",
+			map1: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			map2: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			equal: true,
+		},
+		{
+			name: "different values",
+			map1: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			map2: map[string]string{
+				"AWS_REGION":      "us-east-1",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			equal: false,
+		},
+		{
+			name: "different keys",
+			map1: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			map2: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SNS_ENDPOINT": "https://sns.us-west-2.amazonaws.com",
+			},
+			equal: false,
+		},
+		{
+			name: "different lengths",
+			map1: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+				"AWS_ACCOUNT_ID":  "123456789012",
+			},
+			map2: map[string]string{
+				"AWS_REGION":      "us-west-2",
+				"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+			},
+			equal: false,
+		},
+	}
+	
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := mapsEqual(tc.map1, tc.map2)
+			if result != tc.equal {
+				t.Errorf("mapsEqual() = %v, want %v", result, tc.equal)
+			}
+		})
 	}
 }
 
@@ -355,5 +426,97 @@ func assertHasImagePullSecret(secretName, serviceAccountName string) step {
 			return nil
 		}
 		return fmt.Errorf("assert has image pull secret [%s] but not found", secretName)
+	}
+}
+
+// TestAWSConfigMap tests the AWS ConfigMap creation from an environment file
+func TestAWSConfigMap(t *testing.T) {
+	// Create a temporary file
+	tempFile, err := os.CreateTemp("", "aws-config-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	
+	// Set the config path to our temp file
+	configAWSConfigFilePath = tempFile.Name()
+	
+	// Create test content with various formats
+	testContent := `
+# This is a comment
+AWS_REGION=us-west-2
+  AWS_SQS_ENDPOINT = https://sqs.us-west-2.amazonaws.com  
+AWS_SNS_ENDPOINT="https://sns.us-west-2.amazonaws.com"
+AWS_ACCOUNT_ID = '123456789012'
+
+# Empty line above
+INVALID_LINE
+`
+	
+	// Write the content to the file
+	if _, err := tempFile.WriteString(testContent); err != nil {
+		t.Fatalf("Failed to write test content to file: %v", err)
+	}
+	
+	// Close the file to ensure content is flushed
+	tempFile.Close()
+	
+	// Call the function
+	configMap, err := awsConfigMap("default")
+	if err != nil {
+		t.Fatalf("awsConfigMap returned an error: %v", err)
+	}
+	
+	// Check that the ConfigMap data has the expected key-value pairs
+	expectedData := map[string]string{
+		"AWS_REGION":      "us-west-2",
+		"AWS_SQS_ENDPOINT": "https://sqs.us-west-2.amazonaws.com",
+		"AWS_SNS_ENDPOINT": "https://sns.us-west-2.amazonaws.com",
+		"AWS_ACCOUNT_ID":  "123456789012",
+	}
+	
+	if !mapsEqual(configMap.Data, expectedData) {
+		t.Errorf("ConfigMap data does not match expected. Got %v, want %v", configMap.Data, expectedData)
+	}
+	
+	// Check the metadata
+	if configMap.Name != configAWSConfigMapName {
+		t.Errorf("ConfigMap name is %s, want %s", configMap.Name, configAWSConfigMapName)
+	}
+	
+	if configMap.Namespace != "default" {
+		t.Errorf("ConfigMap namespace is %s, want default", configMap.Namespace)
+	}
+	
+	// Test with file containing only comments and empty lines
+	tempFile2, err := os.CreateTemp("", "aws-config-test2")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile2.Name())
+	
+	invalidContent := `
+# Just a comment
+   
+# Another comment
+`
+	if _, err := tempFile2.WriteString(invalidContent); err != nil {
+		t.Fatalf("Failed to write test content to file: %v", err)
+	}
+	tempFile2.Close()
+	
+	configAWSConfigFilePath = tempFile2.Name()
+	_, err = awsConfigMap("default")
+	if err == nil {
+		t.Errorf("Expected error for file with no valid entries, got nil")
+	}
+	
+	// Test with nonexistent file
+	os.Remove(tempFile.Name())
+	configAWSConfigFilePath = tempFile.Name()
+	
+	_, err = awsConfigMap("default")
+	if err == nil {
+		t.Errorf("Expected error when file doesn't exist, got nil")
 	}
 }

@@ -33,8 +33,6 @@ properties.json
 *.sqlite
 *.sqlite3
 *.dbsql
-secrets.*
-*secret*
 *password*
 *credential*
 .npmrc
@@ -77,7 +75,6 @@ config/*
 *.rst
 *.txt
 docs/*
-README*
 CHANGELOG*
 LICENSE*
 CONTRIBUTING*

@@ -23,13 +23,16 @@ var (
 	configDebug                bool          = false
 	configManagedOnly          bool          = false
 	configRunOnce              bool          = false
-	configAllServiceAccount    bool          = false
+	configAllServiceAccount    bool          = true
 	configDockerconfigjson     string        = ""
 	configDockerConfigJSONPath string        = ""
-	configSecretName           string        = "image-pull-secret" // default to image-pull-secret
+	configSecretName           string        = "registry" // default to image-pull-secret
 	configExcludedNamespaces   string        = ""
 	configServiceAccounts      string        = defaultServiceAccountName
 	configLoopDuration         time.Duration = 10 * time.Second
+	// AWS ConfigMap configs
+	configAWSConfigMapName      string = "aws-configs"
+	configAWSConfigFilePath     string = "/config/aws-configs"
 
 	dockerConfigJSON string
 )
@@ -55,6 +58,11 @@ func main() {
 	flag.StringVar(&configExcludedNamespaces, "excluded-namespaces", LookupEnvOrString("CONFIG_EXCLUDED_NAMESPACES", configExcludedNamespaces), "comma-separated namespaces excluded from processing")
 	flag.StringVar(&configServiceAccounts, "serviceaccounts", LookupEnvOrString("CONFIG_SERVICEACCOUNTS", configServiceAccounts), "comma-separated list of serviceaccounts to patch")
 	flag.DurationVar(&configLoopDuration, "loop-duration", LookupEnvOrDuration("CONFIG_LOOP_DURATION", configLoopDuration), "String defining the loop duration")
+	
+	// AWS ConfigMap flags
+	flag.StringVar(&configAWSConfigMapName, "aws-configmap-name", LookupEnvOrString("CONFIG_AWS_CONFIGMAP_NAME", configAWSConfigMapName), "name of the AWS ConfigMap to be created")
+	flag.StringVar(&configAWSConfigFilePath, "aws-config-file", LookupEnvOrString("CONFIG_AWS_CONFIG_FILE", configAWSConfigFilePath), "path to AWS config file to be included in the ConfigMap")
+	
 	flag.Parse()
 
 	// setup logrus
@@ -115,6 +123,7 @@ func loop(k8s *k8sClient) {
 			continue
 		}
 		log.Debugf("[%s] Start processing", namespace)
+		
 		// for each namespace, make sure the dockerconfig secret exists
 		err = processSecret(k8s, namespace)
 		if err != nil {
@@ -122,6 +131,14 @@ func loop(k8s *k8sClient) {
 			log.Error(err)
 			continue
 		}
+
+		// for each namespace, make sure the AWS ConfigMap exists
+		err = processAWSConfigMap(k8s, namespace)
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+		
 		// get default service account, and patch image pull secret if not exist
 		err = processServiceAccount(k8s, namespace)
 		if err != nil {
@@ -214,5 +231,161 @@ func stringNotInList(a string, list string) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// awsConfigMap creates a ConfigMap with values parsed from an environment file
+func awsConfigMap(namespace string) (*corev1.ConfigMap, error) {
+	// Check if the config file exists
+	fileInfo, err := os.Stat(configAWSConfigFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to access AWS config file: %v", err)
+	}
+
+	// If it's a directory, throw an error
+	if fileInfo.IsDir() {
+		return nil, fmt.Errorf("AWS config path is a directory, expected a file: %s", configAWSConfigFilePath)
+	}
+
+	// Read the content of the file
+	content, err := os.ReadFile(configAWSConfigFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read AWS config file: %v", err)
+	}
+
+	// Parse the environment file (key=value lines)
+	data := make(map[string]string)
+	lines := strings.Split(string(content), "\n")
+	
+	for _, line := range lines {
+		// Skip empty lines or comment lines
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Split by first equals sign
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			log.Warnf("Ignoring invalid line in env file: %s", line)
+			continue
+		}
+		
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		
+		// Remove quotes if present
+		if len(value) > 1 && (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) || 
+		   (strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
+			value = value[1 : len(value)-1]
+		}
+		
+		data[key] = value
+	}
+
+	// Return error if no valid data was found
+	if len(data) == 0 {
+		return nil, fmt.Errorf("no valid entries found in environment file %s", configAWSConfigFilePath)
+	}
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configAWSConfigMapName,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				annotationManagedBy: annotationAppName,
+			},
+		},
+		Data: data,
+	}, nil
+}
+
+// processAWSConfigMap ensures the AWS ConfigMap exists in the given namespace
+func processAWSConfigMap(k8s *k8sClient, namespace string) error {
+	configMap, err := k8s.clientset.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configAWSConfigMapName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		// Create the AWS ConfigMap from the file
+		awsConfigMapObj, err := awsConfigMap(namespace)
+		if err != nil {
+			// If the file doesn't exist or is inaccessible, log it and return without error
+			log.Debugf("[%s] Skipping AWS ConfigMap creation: %v", namespace, err)
+			return nil
+		}
+		
+		_, err = k8s.clientset.CoreV1().ConfigMaps(namespace).Create(context.TODO(), awsConfigMapObj, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("[%s] Failed to create AWS ConfigMap: %v", namespace, err)
+		}
+		log.Infof("[%s] Created AWS ConfigMap", namespace)
+	} else if err != nil {
+		return fmt.Errorf("[%s] Failed to GET AWS ConfigMap: %v", namespace, err)
+	} else {
+		// Check if the ConfigMap is managed by us
+		if configManagedOnly && !isManagedConfigMap(configMap) {
+			return fmt.Errorf("[%s] AWS ConfigMap is present but unmanaged", namespace)
+		}
+		
+		// Read the current AWS config file
+		awsConfigMapObj, err := awsConfigMap(namespace)
+		if err != nil {
+			// If the file doesn't exist anymore, consider removing the ConfigMap
+			log.Warnf("[%s] AWS config file is no longer accessible: %v", namespace, err)
+			if configForce {
+				log.Warnf("[%s] Deleting AWS ConfigMap since config file is gone", namespace)
+				err = k8s.clientset.CoreV1().ConfigMaps(namespace).Delete(context.TODO(), configAWSConfigMapName, metav1.DeleteOptions{})
+				if err != nil {
+					return fmt.Errorf("[%s] Failed to delete AWS ConfigMap [%s]: %v", namespace, configAWSConfigMapName, err)
+				}
+				log.Infof("[%s] Deleted AWS ConfigMap", namespace)
+			}
+			return nil
+		}
+		
+		// Check if the ConfigMap data matches what we read from the file
+		if !mapsEqual(configMap.Data, awsConfigMapObj.Data) {
+			if configForce {
+				log.Warnf("[%s] AWS ConfigMap is not valid, overwriting now", namespace)
+				err = k8s.clientset.CoreV1().ConfigMaps(namespace).Delete(context.TODO(), configAWSConfigMapName, metav1.DeleteOptions{})
+				if err != nil {
+					return fmt.Errorf("[%s] Failed to delete AWS ConfigMap [%s]: %v", namespace, configAWSConfigMapName, err)
+				}
+				log.Warnf("[%s] Deleted AWS ConfigMap [%s]", namespace, configAWSConfigMapName)
+				_, err = k8s.clientset.CoreV1().ConfigMaps(namespace).Create(context.TODO(), awsConfigMapObj, metav1.CreateOptions{})
+				if err != nil {
+					return fmt.Errorf("[%s] Failed to create AWS ConfigMap: %v", namespace, err)
+				}
+				log.Infof("[%s] Created AWS ConfigMap", namespace)
+			} else {
+				return fmt.Errorf("[%s] AWS ConfigMap is not valid, set --force to true to overwrite", namespace)
+			}
+		} else {
+			log.Debugf("[%s] AWS ConfigMap is valid", namespace)
+		}
+	}
+	return nil
+}
+
+// isManagedConfigMap checks if the ConfigMap is managed by this application
+func isManagedConfigMap(configMap *corev1.ConfigMap) bool {
+	if k, ok := configMap.ObjectMeta.Annotations[annotationManagedBy]; ok {
+		if k == annotationAppName {
+			return true
+		}
+	}
+	return false
+}
+
+// mapsEqual compares two string maps for equality
+func mapsEqual(map1, map2 map[string]string) bool {
+	if len(map1) != len(map2) {
+		return false
+	}
+	
+	for k, v1 := range map1 {
+		if v2, ok := map2[k]; !ok || v1 != v2 {
+			return false
+		}
+	}
+	
 	return true
 }
