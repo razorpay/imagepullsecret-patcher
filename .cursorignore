@@ -28,9 +28,6 @@ logs/*
 *.sqlite3
 *.dbsql
 secrets.*
-*secret*
-*password*
-*credential*
 .npmrc
 .yarnrc
 .aws/*
@@ -64,17 +61,6 @@ authorized_keys
 .env.test
 .env.production
 config/*
-
-# Documentation and Notes
-*.md
-*.mdx
-*.rst
-*.txt
-docs/*
-README*
-CHANGELOG*
-LICENSE*
-CONTRIBUTING*
 
 # Database Files
 *.sql
