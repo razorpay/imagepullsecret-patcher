@@ -1,25 +1,51 @@
-name: PR Workflow
-
+name: Credstash CI
 on: [push]
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    name: build
-    steps:
-      - name: checkout
-        id: checkout
-        uses: actions/checkout@v2
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Login to Docker Hub
-        uses: docker/login-action@v1
+  Build-Docker-Image:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux-amd64
+          - linux-arm64
+    runs-on: 
+      - k8s-runner
+      - non-api
+      - ${{ matrix.platform }}
+    steps: 
+      - name: Build Multi-Arch Image
+        uses: razorpay/docker-image-build-push@v1
         with:
-          username: ${{ secrets.PUBLIC_DOCKER_USERNAME }}
-          password: ${{ secrets.PUBLIC_DOCKER_PASSWORD }}
-      - name: build imagepullsecret-patcher image
-        uses: docker/build-push-action@v2
-        with:
-          tags: razorpay/imagepullsecret-patcher:${{ github.sha }}
-          push: true
+          username: ${{ secrets.HARBOR_DOCKER_USERNAME }}
+          password: ${{ secrets.HARBOR_DOCKER_PASSWORD }}
+          registry: c.rzp.io
+          enable-login: true
+          repository: imagepullsecret-patcher
           file: Dockerfile
+          push: true
+          suffix: -${{ matrix.platform }}
           build-args: GIT_COMMIT_HASH=${{ github.sha }}
+
+  Build-Multi-Arch-Manifest:
+    needs:
+      - Build-Docker-Image
+    runs-on:
+      - k8s-runner
+      - non-api
+    steps:
+      - name: Build Multi-Arch Manifest
+        uses: razorpay/docker-image-build-push@v1
+        with:
+          username: ${{ secrets.HARBOR_DOCKER_USERNAME }}
+          password: ${{ secrets.HARBOR_DOCKER_PASSWORD }}
+          registry: c.rzp.io
+          enable-login: true
+          repository: imagepullsecret-patcher
+          custom-tag: ${{ github.sha }}
+          file: Dockerfile
+          trigger-multiarch-image-build: true
+          multiarch-suffixes: |
+            -linux-amd64
+            -linux-arm64
+
